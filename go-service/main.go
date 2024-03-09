@@ -1,32 +1,159 @@
 package main
 
 import (
-	"log"
+	"context"
+	"net/http"
 	"net"
+	"os"
 
+	db "github.com/gbengafagbola/microservice/go-service/db/sqlc"
+	"github.com/gbengafagbola/microservice/go-service/mail"
+	"github.com/gbengafagbola/microservice/go-service/gapi"
+	"github.com/gbengafagbola/microservice/go-service/pb"
+	"github.com/gbengafagbola/microservice/go-service/util"
+	"github.com/gbengafagbola/microservice/go-service/worker"
+	_ "github.com/gbengafagbola/microservice/go-service/doc/statik"
 	"google.golang.org/grpc"
-	"github.com/gbengafagbola/microservice/pb"
+
+	"github.com/hibiken/asynq"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
+	"google.golang.org/grpc/reflection"
+	"github.com/golang-migrate/migrate/v4"
+	"github.com/rakyll/statik/fs"
+	_ "github.com/golang-migrate/migrate/v4/database/postgres"
+	_ "github.com/golang-migrate/migrate/v4/source/file"
+	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
-type server struct{}
+func main() {
+	config, err := util.LoadConfig(".")
+	if err != nil {
+		log.Fatal().Err(err).Msg("cannot load config")
+	}
 
-func (s *server) SayHello(req *pb.HelloRequest, stream pb.Greeter_SayHelloServer) error {
-	log.Printf("Received: %v", req.Name)
-	resp := &pb.HelloResponse{Message: "Hello, " + req.Name}
-	return stream.Send(resp)
+	if config.Environment == "development" {
+		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+	}
+ 
+	connPool, err := pgxpool.New(context.Background(), config.DBSource)
+	if err != nil {
+		log.Fatal().Err(err).Msg("cannot connect to db")
+	}
+
+	runDBMigration(config.MigrationURL, config.DBSource)
+
+	store := db.NewStore(connPool)
+
+	redisOpt := asynq.RedisClientOpt{
+		Addr: config.RedisAddress,
+	}
+
+	taskDistributor := worker.NewRedisTaskDistributor(redisOpt)
+	go runTaskProcessor(config, redisOpt, store)
+	go runGatewayServer(config, store, taskDistributor)
+	runGrpcServer(config, store, taskDistributor)
+
 }
 
-func main() {
-	listener, err := net.Listen("tcp", ":50051")
-	if err != nil {
-		log.Fatalf("Failed to listen: %v", err)
-	}
-  
-	srv := grpc.NewServer()
-	pb.RegisterGreeterServer(srv, &server{})
 
-	log.Println("Server is listening on :50051")
-	if err := srv.Serve(listener); err != nil {
-		log.Fatalf("Failed to serve: %v", err)
-	} 
+func runGrpcServer(config util.Config, store db.Store, taskDistributor worker.TaskDistributor) {
+	server, err := gapi.NewServer(config, store, taskDistributor)
+	if err != nil {
+		log.Fatal().Err(err).Msg("cannot create server")
+	}
+	grpcLogger := grpc.UnaryInterceptor(gapi.GrpcLogger)
+
+	grpcServer := grpc.NewServer(grpcLogger)
+	pb.RegisterGoServiceServer(grpcServer, server)
+	reflection.Register(grpcServer)
+
+	listener, err := net.Listen("tcp", config.GRPCServerAddress)
+	if err != nil {
+		log.Fatal().Err(err).Msg("cannot create listener")
+	}
+
+	log.Info().Msgf("start gRPC server at %s", listener.Addr().String())
+	err = grpcServer.Serve(listener)
+	if err != nil {
+		log.Fatal().Err(err).Msg("cannot start gRPC server")
+	}
+}
+
+
+func runGatewayServer(config util.Config, store db.Store, taskDistributor worker.TaskDistributor) {
+	// server, err := gapi.NewServer(config, store, taskDistributor)
+	server, err := gapi.NewServer(config, store, taskDistributor)
+	if err != nil {
+		log.Fatal().Err(err).Msg("cannot create server")
+	}
+
+	jsonOption := runtime.WithMarshalerOption(runtime.MIMEWildcard, &runtime.JSONPb{
+		MarshalOptions: protojson.MarshalOptions{
+			UseProtoNames: true,
+		},
+		UnmarshalOptions: protojson.UnmarshalOptions{
+			DiscardUnknown: true,
+		},
+	})
+
+	grpcMux := runtime.NewServeMux(jsonOption)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err = pb.RegisterGoServiceHandlerServer(ctx, grpcMux, server)
+	if err != nil {
+		log.Fatal().Err(err).Msg("cannot register handler server")
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/", grpcMux)
+
+	statikFS, err := fs.New()
+	if err != nil {
+		log.Fatal().Err(err).Msg("cannot create statik fs")
+	}
+
+	swaggerHandler := http.StripPrefix("/swagger/", http.FileServer(statikFS))
+	mux.Handle("/swagger/", swaggerHandler)
+
+	listener, err := net.Listen("tcp", config.HTTPServerAddress)
+	if err != nil {
+		log.Fatal().Err(err).Msg("cannot create listener")
+	}
+
+	log.Info().Msgf("start HTTP gateway server at %s", listener.Addr().String())
+	handler := gapi.HttpLogger(mux)
+	err = http.Serve(listener, handler)
+	// err = http.Serve(listener, mux)
+	if err != nil {
+		log.Fatal().Err(err).Msg("cannot start HTTP gateway server")
+	}
+}
+
+func runDBMigration(migrationURL string, dbSource string) {
+	migration, err := migrate.New(migrationURL, dbSource)
+	if err != nil {
+		log.Fatal().Err(err).Msg("cannot create new migrate instance")
+	}
+
+	if err = migration.Up(); err != nil && err != migrate.ErrNoChange {
+		log.Fatal().Err(err).Msg("failed to run migrate up")
+	}
+
+	log.Info().Msg("db migrated successfully")
+}
+
+
+func runTaskProcessor(config util.Config, redisOpt asynq.RedisClientOpt, store db.Store) {
+	mailer := mail.NewGmailSender(config.EmailSenderName, config.EmailSenderAddress, config.EmailSenderPassword)
+	taskProcessor := worker.NewRedisTaskProcessor(redisOpt, store, mailer)
+	log.Info().Msg("start task processor")
+	err := taskProcessor.Start()
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to start task processor")
+	}
 }
